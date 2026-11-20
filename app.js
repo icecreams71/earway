@@ -113,7 +113,7 @@ const feedbackNames=['heard-minor-2nd','heard-major-2nd','heard-minor-3rd','hear
 async function loadFeedback(){
   if(feedbackBuffers)return;
   const entries=await Promise.all(feedbackNames.map(async name=>{
-    const response=await fetch('feedback/'+name+'.mp3');if(!response.ok)throw new Error('Missing feedback/'+name+'.mp3');
+    const response=await fetch('feedback/'+name+'.mp3?v=2');if(!response.ok)throw new Error('Missing feedback/'+name+'.mp3');
     return [name,await audio.decodeAudioData(await response.arrayBuffer())];
   }));feedbackBuffers=Object.fromEntries(entries);
 }
