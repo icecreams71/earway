@@ -3,6 +3,7 @@ const chords=[{name:'Major',notes:[0,4,7],aliases:['major','major chord','major 
 const levels=[{title:'Ascending intervals',subtitle:'Find the distance as notes climb',type:'MELODIC · ASCENDING',icon:'↗',description:'Two notes, one after the other. Find the distance as they climb.',pool:intervals,mode:'up'},{title:'Descending intervals',subtitle:'A new perspective, from top to bottom',type:'MELODIC · DESCENDING',icon:'↘',description:'Same distances, different direction. Listen as the notes fall.',pool:intervals,mode:'down'},{title:'Harmonic intervals',subtitle:'Two notes, played together',type:'HARMONIC · INTERVALS',icon:'≋',description:'Hear both notes at once and find the interval between them.',pool:intervals,mode:'harmonic'},{title:'Chord qualities',subtitle:'Major, minor, diminished & augmented',type:'HARMONIC · TRIADS',icon:'♬',description:'Get to know the color of four essential triad qualities.',pool:chords.slice(0,4),mode:'chord'},{title:'Sevenths & extensions',subtitle:'Add some color to your chords',type:'HARMONIC · EXTENSIONS',icon:'✳',description:'Explore seventh and ninth chords, and hear the color in each.',pool:chords.slice(4),mode:'chord'}];
 const $=id=>document.getElementById(id);const KEY='earway-progress-v1';let progress;try{progress=JSON.parse(localStorage.getItem(KEY))}catch{}if(!progress||!Array.isArray(progress.correct)||progress.correct.length!==5)progress={score:0,correct:[0,0,0,0,0],best:0};let selected=0,active=false,current=null,attempts=0,streak=0,sessionScore=0,question=0,audio=null,run=0,timer=null,speechToken=0,speechTimer=null;
 let model=null,recognizer=null,micStream=null,micSource=null,micProcessor=null,micSilence=null,listenWanted=false,setupAbort=null,sessionToken=0,touchOnly=false;
+let wakeLock=null,wakeRequest=null,feedbackBuffers=null,feedbackSources=[];
 const MODEL_URL='https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz';
 const INSTRUMENT_KEY='earway-instrument-v1';let instrument='soft-keys';try{let saved=localStorage.getItem(INSTRUMENT_KEY);if(['soft-keys','mellow','sine','organ'].includes(saved))instrument=saved}catch{}$('instrument').value=instrument;$('instrument').addEventListener('change',e=>{instrument=e.target.value;try{localStorage.setItem(INSTRUMENT_KEY,instrument)}catch{}});
 function save(){try{localStorage.setItem(KEY,JSON.stringify(progress))}catch{}}
@@ -13,11 +14,32 @@ function stopListening(){
   listenWanted=false;$('orb').classList.remove('active');
   if(recognizer){try{recognizer.remove()}catch{}recognizer=null}
 }
+function buildGrammar(level){
+  const phrases=new Set(['[unk]','repeat','replay','again','play again','skip','pass','stop','quit','exit']);
+  for(const item of level.pool){
+    const choices=[...item.aliases];
+    if(level.mode!=='chord'){
+      if(item.name==='Perfect 4th')choices.push('perfect forth','forth','perfect four','four');
+      if(item.name==='Perfect 5th')choices.push('perfect five','five','perfect fith','fith');
+      if(item.name==='Tritone')choices.push('sharp fourth','sharp forth','flat fifth');
+      const degree={1:'second',2:'second',3:'third',4:'third',8:'sixth',9:'sixth',10:'seventh',11:'seventh'}[item.n];
+      if(degree&&item.name.startsWith('Minor'))choices.push('flat '+degree);
+      const count=['zero','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve'][item.n];if(count){choices.push(count+' semitones',count+' half steps');if(item.n===1)choices.push('one semitone','one half step')}
+    }
+    for(const c of choices){
+      if(!/^[a-z ]+$/.test(c))continue;
+      phrases.add(c);
+      // Common fillers make the constrained recognizer less brittle, while the vocabulary remains focused.
+      for(const prefix of ['a','the','its','its a','it is','it is a','i think','i think it is','i think it is a'])phrases.add(prefix+' '+c);
+    }
+  }
+  return JSON.stringify([...phrases]);
+}
 function listen(){
   if(!active||!current)return;stopListening();
   if(touchOnly||!model||!micStream){status('Use touch answers','Voice is unavailable. Only use touch controls while parked.');return}
   try{
-    const r=new model.KaldiRecognizer(audio.sampleRate);recognizer=r;
+    const r=new model.KaldiRecognizer(audio.sampleRate,buildGrammar(levels[selected]));recognizer=r;
     r.on('result',message=>{
       if(!active||!listenWanted||recognizer!==r)return;
       const text=(message.result&&message.result.text||'').trim();
@@ -58,7 +80,7 @@ function parseAnswer(raw,pool,mode){
   if(qualities>1)return null;
   const patterns=[
     [2,/\b(second|2nd|two|2)\b/], [3,/\b(third|3rd|three|3)\b/],
-    [4,/\b(fourth|4th|four|4)\b/], [5,/\b(fifth|5th|five|5)\b/],
+    [4,/\b(fourth|forth|4th|four|4)\b/], [5,/\b(fifth|fith|fift|5th|five|5)\b/],
     [6,/\b(sixth|6th|six|6)\b/], [7,/\b(seventh|7th|seven|7)\b/],
     [8,/\b(octave|eighth|8th|eight|8)\b/], [9,/\b(ninth|9th|nine|9)\b/]
   ];
@@ -86,9 +108,37 @@ function parseAnswer(raw,pool,mode){
   else if(!d||d===3){if(major)name='Major';else if(minor)name='Minor';else if(diminished)name='Diminished';else if(augmented)name='Augmented'}
   return pool.find(p=>p.name===name)||null;
 }
-function handleVoice(results){const spoken=results.map(normalize);if(spoken.some(x=>/\b(repeat|replay|again)\b/.test(x))){replay();return}if(spoken.some(x=>/\b(skip|pass)\b/.test(x))){skip();return}if(spoken.some(x=>/\b(stop|quit|exit)\b/.test(x))){endGame();return}let choice=null;for(const text of spoken){choice=parseAnswer(text,levels[selected].pool,levels[selected].mode);if(choice)break}if(choice){answer(choice)}else{status('Not quite sure what you said','Try a full name, like “minor third”, or say “repeat”.');announce('I didn’t catch that. Please try the full name.',listen)}}
-function cancelSpeech(){speechToken++;clearTimeout(speechTimer);if('speechSynthesis' in window)window.speechSynthesis.cancel()}
-function announce(text,after){cancelSpeech();const token=speechToken;let done=false;const finish=()=>{if(done||token!==speechToken||!active)return;done=true;clearTimeout(speechTimer);after()};if(!('speechSynthesis' in window)){speechTimer=setTimeout(finish,1800);return}let utterance=new SpeechSynthesisUtterance(text);utterance.lang='en-GB';utterance.rate=1.05;utterance.onend=finish;utterance.onerror=finish;speechTimer=setTimeout(finish,6000);window.speechSynthesis.speak(utterance)}
+function handleVoice(results){const spoken=results.map(normalize);if(spoken.some(x=>/\b(repeat|replay|again)\b/.test(x))){replay();return}if(spoken.some(x=>/\b(skip|pass)\b/.test(x))){skip();return}if(spoken.some(x=>/\b(stop|quit|exit)\b/.test(x))){endGame();return}let choice=null;for(const text of spoken){choice=parseAnswer(text,levels[selected].pool,levels[selected].mode);if(choice)break}if(choice){answer(choice)}else{status('Not quite sure what you said','Try a full name, like “minor third”, or say “repeat”.');announce(['unclear'],listen)}}
+const feedbackNames=['heard-minor-2nd','heard-major-2nd','heard-minor-3rd','heard-major-3rd','heard-perfect-4th','heard-tritone','heard-perfect-5th','heard-minor-6th','heard-major-6th','heard-minor-7th','heard-major-7th','heard-octave','heard-major','heard-minor','heard-diminished','heard-augmented','heard-dominant-7th','heard-major-9th','heard-minor-9th','heard-dominant-9th','correct-20','correct-40','correct-60','correct-80','correct-100','unlock','next','wrong','unclear','was-minor-2nd','was-major-2nd','was-minor-3rd','was-major-3rd','was-perfect-4th','was-tritone','was-perfect-5th','was-minor-6th','was-major-6th','was-minor-7th','was-major-7th','was-octave','was-major','was-minor','was-diminished','was-augmented','was-dominant-7th','was-major-9th','was-minor-9th','was-dominant-9th'];
+async function loadFeedback(){
+  if(feedbackBuffers)return;
+  const entries=await Promise.all(feedbackNames.map(async name=>{
+    const response=await fetch('feedback/'+name+'.mp3');if(!response.ok)throw new Error('Missing feedback/'+name+'.mp3');
+    return [name,await audio.decodeAudioData(await response.arrayBuffer())];
+  }));feedbackBuffers=Object.fromEntries(entries);
+}
+function cancelSpeech(){speechToken++;clearTimeout(speechTimer);for(const source of feedbackSources){try{source.stop()}catch{}}feedbackSources=[]}
+function playFeedback(names,after,requireSession=true){
+  cancelSpeech();const token=speechToken;
+  if(!feedbackBuffers||names.some(n=>!feedbackBuffers[n])){if(requireSession){$('feedbackStatus').classList.remove('hidden');speechTimer=setTimeout(()=>{if(active&&token===speechToken&&after)after()},2000)}return}
+  let when=audio.currentTime+.05;
+  for(const name of names){const source=audio.createBufferSource();source.buffer=feedbackBuffers[name];source.connect(audio.destination);source.start(when);when+=source.buffer.duration;feedbackSources.push(source)}
+  const last=feedbackSources[feedbackSources.length-1];last.onended=()=>{if(token!==speechToken||(requireSession&&!active))return;feedbackSources=[];if(after)after()};
+}
+function announce(names,after){playFeedback(names,after)}
+async function previewFeedback(){try{audio=audio||new (window.AudioContext||window.webkitAudioContext)();await audio.resume();await loadFeedback();playFeedback(['correct-100'],null,false)}catch(e){alert('Spoken feedback could not load. Check the feedback folder and sound settings.')}}
+function wakeMessage(message,warning=false){$('wakeStatus').textContent=message;$('wakeStatus').classList.toggle('warning',warning)}
+async function requestWake(){
+  if(!active||document.visibilityState!=='visible'||wakeLock||wakeRequest)return;
+  if(!navigator.wakeLock){wakeMessage('Screen wake lock unavailable. Check your screen timeout while parked.',true);return}
+  const token=sessionToken;
+  wakeRequest=navigator.wakeLock.request('screen');
+  try{const lock=await wakeRequest;if(!active||token!==sessionToken||document.visibilityState!=='visible'){await lock.release();return}wakeLock=lock;wakeMessage('Screen will stay awake during this session.');lock.addEventListener('release',()=>{if(wakeLock===lock){wakeLock=null;if(active)wakeMessage('Screen wake lock released. Reopen the app while parked.',true)}})}
+  catch{if(active&&token===sessionToken)wakeMessage('Could not keep screen awake. Check your screen timeout while parked.',true)}
+  finally{wakeRequest=null;if(active&&!wakeLock&&document.visibilityState==='visible'&&token!==sessionToken)requestWake()}
+}
+function releaseWake(){if(wakeLock){const lock=wakeLock;wakeLock=null;lock.release().catch(()=>{})}}
+document.addEventListener('visibilitychange',()=>{if(active&&document.visibilityState==='visible')requestWake()});
 function tone(freq,start,duration){
   // Oscillator-based timbres, not sampled acoustic instruments. Keep chord peaks modest.
   const timbres={
@@ -109,15 +159,16 @@ function tone(freq,start,duration){
 async function previewSound(){try{audio=audio||new (window.AudioContext||window.webkitAudioContext)();await audio.resume();const t=audio.currentTime+.05;tone(261.63,t,.7);tone(329.63,t+.85,.7)}catch{alert('Audio could not start. Check your browser and sound settings.')}}
 function play(){if(!active||!current)return;cancelSpeech();stopListening();const token=++run;clearTimeout(timer);$('transcript').textContent='';status('Listen closely','Name what you hear when the notes finish.');let l=levels[selected],t=audio.currentTime+.12,root=current.root,notes=l.mode==='chord'?current.item.notes:[0,current.item.n],duration;if(l.mode==='down')notes=[current.item.n,0];if(l.mode==='up'||l.mode==='down'){notes.forEach((n,i)=>tone(440*Math.pow(2,(root+n-69)/12),t+i*.85,.7));duration=1900}else{notes.forEach(n=>tone(440*Math.pow(2,(root+n-69)/12),t,1.35));duration=1700}timer=setTimeout(()=>{if(active&&token===run)listen()},duration)}
 function next(){if(!active)return;clearTimeout(timer);stopListening();const pool=levels[selected].pool;let item=pool[Math.floor(Math.random()*pool.length)];if(current&&pool.length>1)while(item===current.item)item=pool[Math.floor(Math.random()*pool.length)];current={item,root:48+Math.floor(Math.random()*13)};attempts=0;question++;$('questionNumber').textContent=String(question).padStart(2,'0');$('answerButtons').innerHTML='';pool.forEach(p=>{let b=document.createElement('button');b.textContent=p.name;b.addEventListener('click',()=>answer(p));$('answerButtons').append(b)});play()}
-function answer(item){if(!active||!current)return;stopListening();++run;clearTimeout(timer);if(item===current.item){const points=Math.max(20,100-attempts*20);sessionScore+=points;streak++;progress.score+=points;progress.correct[selected]++;progress.best=Math.max(progress.best,streak);save();render();$('streak').textContent=streak;$('sessionScore').textContent=sessionScore;const completed=progress.correct[selected]===5;const correctName=current.item.name;status('That’s right! +'+points,'It was '+correctName+'. Next one coming up.');$('transcript').textContent='';current=null;announce('Correct. '+points+' points. '+(completed&&selected<levels.length-1?'Level complete. The next level is unlocked. ': '')+'Next question.',next)}else{attempts++;streak=0;$('streak').textContent=0;status('Not quite — try again','Say another answer, or say “repeat”.');announce('Not quite. Try again.',listen)}}
+function answer(item){if(!active||!current)return;stopListening();++run;clearTimeout(timer);if(item===current.item){const points=Math.max(20,100-attempts*20);sessionScore+=points;streak++;progress.score+=points;progress.correct[selected]++;progress.best=Math.max(progress.best,streak);save();render();$('streak').textContent=streak;$('sessionScore').textContent=sessionScore;const completed=progress.correct[selected]===5;const correctName=current.item.name;status('That’s right! +'+points,'It was '+correctName+'. Next one coming up.');$('transcript').textContent='';current=null;announce(['correct-'+points,...(completed&&selected<levels.length-1?['unlock']:[]),'next'],next)}else{attempts++;streak=0;$('streak').textContent=0;status('Not quite — try again','Say another answer, or say “repeat”.');announce(['heard-'+item.name.toLowerCase().replace(/ /g,'-'),'wrong'],listen)}}
 function replay(){if(!active||!current)return;attempts++;play()}
-function skip(){if(!active||!current)return;stopListening();++run;clearTimeout(timer);streak=0;$('streak').textContent=0;const name=current.item.name;status('On to the next','That was '+name+'.');current=null;announce('That was '+name+'. Next question.',next)}
+function skip(){if(!active||!current)return;stopListening();++run;clearTimeout(timer);streak=0;$('streak').textContent=0;const name=current.item.name;status('On to the next','That was '+name+'.');current=null;announce(['was-'+name.toLowerCase().replace(/ /g,'-'),'next'],next)}
 async function start(){
   if(active)return;
   active=true;touchOnly=false;question=0;streak=0;sessionScore=0;current=null;const token=++sessionToken;setupAbort=new AbortController();
-  $('streak').textContent='0';$('sessionScore').textContent='0';$('gameTitle').textContent=levels[selected].title;$('gameLevelNumber').textContent='· LEVEL '+String(selected+1).padStart(2,'0');$('gameModal').classList.remove('hidden');$('touchOnlyBtn').classList.add('hidden');$('micBtn').disabled=true;$('repeatBtn').disabled=true;$('skipBtn').disabled=true;$('answerButtons').innerHTML='';
+  $('streak').textContent='0';$('sessionScore').textContent='0';$('gameTitle').textContent=levels[selected].title;$('gameLevelNumber').textContent='· LEVEL '+String(selected+1).padStart(2,'0');$('gameModal').classList.remove('hidden');$('touchOnlyBtn').classList.add('hidden');$('micBtn').disabled=true;$('repeatBtn').disabled=true;$('skipBtn').disabled=true;$('answerButtons').innerHTML='';$('feedbackStatus').classList.add('hidden');wakeMessage('Checking screen wake lock…');requestWake();
   try{
-    audio=audio||new (window.AudioContext||window.webkitAudioContext)();await audio.resume();
+    audio=audio||new (window.AudioContext||window.webkitAudioContext)();await audio.resume();cancelSpeech();
+    status('Preparing spoken feedback','Keep this screen open while parked.');await loadFeedback();if(!active||token!==sessionToken)return;
     if(!navigator.mediaDevices?.getUserMedia||!window.Vosk)throw new Error('Microphone or voice engine unavailable');
     status('Allow the microphone','Grant access while parked to use voice commands.');
     const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,channelCount:1},video:false});
@@ -129,9 +180,9 @@ async function start(){
     micStream.getAudioTracks().forEach(track=>track.addEventListener('ended',()=>{if(active){stopListening();status('Microphone disconnected','End the session and reconnect while parked.');$('touchOnlyBtn').classList.remove('hidden')}}));
     $('micBtn').disabled=false;$('repeatBtn').disabled=false;$('skipBtn').disabled=false;next();
   }catch(e){
-    if(!active||token!==sessionToken)return;releaseVoice();console.error(e);status('Voice setup failed',e.name==='NotAllowedError'?'Allow microphone access in Chrome, then start a new session while parked.':'Check your connection and microphone, then start a new session while parked.');$('touchOnlyBtn').classList.remove('hidden');
+    if(!active||token!==sessionToken)return;releaseVoice();console.error(e);if(!feedbackBuffers)$('feedbackStatus').classList.remove('hidden');status('Voice setup failed',e.name==='NotAllowedError'?'Allow microphone access in Chrome, then start a new session while parked.':'Check your connection, microphone and deployed feedback folder, then start a new session while parked.');$('touchOnlyBtn').classList.remove('hidden');
   }
 }
-function endGame(){active=false;sessionToken++;if(setupAbort)setupAbort.abort();setupAbort=null;cancelSpeech();run++;clearTimeout(timer);releaseVoice(Boolean(model&&model.ready));current=null;$('gameModal').classList.add('hidden');render()}
+function endGame(){active=false;sessionToken++;releaseWake();if(setupAbort)setupAbort.abort();setupAbort=null;cancelSpeech();run++;clearTimeout(timer);releaseVoice(Boolean(model&&model.ready));current=null;$('gameModal').classList.add('hidden');render()}
 function continueTouchOnly(){if(!active)return;cancelSpeech();clearTimeout(timer);if(setupAbort)setupAbort.abort();releaseVoice();touchOnly=true;$('touchOnlyBtn').classList.add('hidden');$('micBtn').disabled=true;$('repeatBtn').disabled=false;$('skipBtn').disabled=false;if(!current)next();else status('Use touch answers','Voice is unavailable. Only use touch controls while parked.')}
-$('touchOnlyBtn').onclick=continueTouchOnly;$('previewInstrument').onclick=previewSound;$('startBtn').onclick=start;$('closeGame').onclick=endGame;$('repeatBtn').onclick=replay;$('skipBtn').onclick=skip;$('micBtn').onclick=()=>{if(active&&current)listen()};$('helpBtn').onclick=()=>$('helpModal').classList.remove('hidden');$('closeHelp').onclick=()=>$('helpModal').classList.add('hidden');$('resetBtn').onclick=()=>$('resetConfirm').classList.remove('hidden');$('cancelReset').onclick=()=>$('resetConfirm').classList.add('hidden');$('confirmReset').onclick=()=>{progress={score:0,correct:[0,0,0,0,0],best:0};selected=0;save();render();$('resetConfirm').classList.add('hidden')};render();
+$('previewFeedback').onclick=previewFeedback;$('touchOnlyBtn').onclick=continueTouchOnly;$('previewInstrument').onclick=previewSound;$('startBtn').onclick=start;$('closeGame').onclick=endGame;$('repeatBtn').onclick=replay;$('skipBtn').onclick=skip;$('micBtn').onclick=()=>{if(active&&current)listen()};$('helpBtn').onclick=()=>$('helpModal').classList.remove('hidden');$('closeHelp').onclick=()=>$('helpModal').classList.add('hidden');$('resetBtn').onclick=()=>$('resetConfirm').classList.remove('hidden');$('cancelReset').onclick=()=>$('resetConfirm').classList.add('hidden');$('confirmReset').onclick=()=>{progress={score:0,correct:[0,0,0,0,0],best:0};selected=0;save();render();$('resetConfirm').classList.add('hidden')};render();
