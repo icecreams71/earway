@@ -136,7 +136,13 @@ function playFeedback(names,after,requireSession=true){
   cancelSpeech();const token=speechToken;
   if(!feedbackBuffers||names.some(n=>!feedbackBuffers[n])){if(requireSession){$('feedbackStatus').classList.remove('hidden');speechTimer=setTimeout(()=>{if(active&&token===speechToken&&after)after()},2000)}return}
   let when=audio.currentTime+.05;
-  for(const name of names){const source=audio.createBufferSource();source.buffer=feedbackBuffers[name];source.connect(audio.destination);source.start(when);when+=source.buffer.duration;feedbackSources.push(source)}
+  for(const name of names){
+    const source=audio.createBufferSource();source.buffer=feedbackBuffers[name];source.connect(audio.destination);source.start(when);
+    // Leave a clear pause between recordings; allow extra breathing room after
+    // 'not quite, try again' before a mnemonic hint begins.
+    const gap=name==='wrong'?.75:.18;
+    when+=source.buffer.duration+gap;feedbackSources.push(source);
+  }
   const last=feedbackSources[feedbackSources.length-1];last.onended=()=>{if(token!==speechToken||(requireSession&&!active))return;feedbackSources=[];if(after)after()};
 }
 function announce(names,after){playFeedback(names,after)}
