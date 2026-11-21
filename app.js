@@ -127,7 +127,8 @@ const feedbackNames=['hint-melodic','hint-harmonic',...Object.values(songHints).
 async function loadFeedback(){
   if(feedbackBuffers)return;
   const entries=await Promise.all(feedbackNames.map(async name=>{
-    const response=await fetch('feedback/'+name+'.mp3?v=2');if(!response.ok)throw new Error('Missing feedback/'+name+'.mp3');
+    const version=(name==='wrong'||name==='unclear')?'3':'2';
+    const response=await fetch('feedback/'+name+'.mp3?v='+version);if(!response.ok)throw new Error('Missing feedback/'+name+'.mp3');
     return [name,await audio.decodeAudioData(await response.arrayBuffer())];
   }));feedbackBuffers=Object.fromEntries(entries);
 }
